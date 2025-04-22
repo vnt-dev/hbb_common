@@ -23,12 +23,25 @@ message PunchHoleRequest {
   ConnType conn_type = 4;
   string token = 5;
   string version = 6;
+  PunchInfo punch_info = 7;
+}
+
+message PunchInfo {
+  NatType nat_type = 1;
+  repeated string public_ips = 2;
+  repeated uint32 public_udp_ports = 3;
+  uint32 public_port_range = 4;
+  string ipv6 = 5;
+  repeated uint32 local_udp_ports = 6;
+  uint32 local_tcp_port = 7;
+  uint32 public_tcp_port = 8;
 }
 
 message PunchHole { 
   bytes socket_addr = 1;
   string relay_server = 2;
   NatType nat_type = 3;
+  PunchInfo punch_info = 4;
 }
 
 message TestNatRequest {
@@ -53,6 +66,7 @@ message PunchHoleSent {
   string relay_server = 3;
   NatType nat_type = 4;
   string version = 5;
+  PunchInfo punch_info = 6;
 }
 
 message RegisterPk {
@@ -93,6 +107,7 @@ message PunchHoleResponse {
   }
   string other_failure = 7;
   int32 feedback = 8;
+  PunchInfo punch_info = 9;
 }
 
 message ConfigUpdate {
