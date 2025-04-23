@@ -5,7 +5,6 @@ use std::convert::{TryFrom, TryInto};
 use std::io;
 use std::io::IoSlice;
 use std::net::SocketAddr;
-use std::str::Utf8Error;
 use std::time::UNIX_EPOCH;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -14,13 +13,13 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 pub enum ProtocolType {
     Ping = 1,
     Pong = 2,
-    Raw = 3,
+    KcpRaw = 3,
 }
 impl TryFrom<u8> for ProtocolType {
     type Error = io::Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        const MAX: u8 = ProtocolType::Raw as u8;
+        const MAX: u8 = ProtocolType::KcpRaw as u8;
         match value {
             1..=MAX => unsafe { Ok(std::mem::transmute::<u8, ProtocolType>(value)) },
             val => Err(io::Error::new(
@@ -36,7 +35,7 @@ impl Into<u8> for ProtocolType {
         match self {
             ProtocolType::Ping => 1,
             ProtocolType::Pong => 2,
-            ProtocolType::Raw => 3,
+            ProtocolType::KcpRaw => 3,
         }
     }
 }

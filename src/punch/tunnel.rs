@@ -1,12 +1,15 @@
 use crate::punch::protocol::{
     convert_ping_pong, now, ping, pong, NetPacket, ProtocolType, HEAD_LEN,
 };
+use crate::punch::PunchContext;
 use async_shutdown::ShutdownManager;
 use bytes::BytesMut;
 use rust_p2p_core::route::route_table::{Route, RouteTable};
 use rust_p2p_core::route::RouteKey;
 use rust_p2p_core::tunnel::{SocketManager, Tunnel, TunnelDispatcher};
 use std::io;
+use std::io::Error;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct TunnelRouter {
@@ -15,6 +18,12 @@ pub struct TunnelRouter {
 }
 
 impl TunnelRouter {
+    pub(crate) fn new(route_table: RouteTable<String>, socket_manager: SocketManager) -> Self {
+        Self {
+            route_table,
+            socket_manager,
+        }
+    }
     pub fn ping(&self, dest: &String) -> io::Result<()> {
         let route = self.route_table.get_route_by_id(dest)?;
         let packet = ping(dest)?;
@@ -25,7 +34,7 @@ impl TunnelRouter {
         let route = self.route_table.get_route_by_id(dest)?;
         let bytes_mut = BytesMut::zeroed(HEAD_LEN + buf.len());
         let mut packet = NetPacket::new(bytes_mut)?;
-        packet.set_protocol(ProtocolType::Raw);
+        packet.set_protocol(ProtocolType::KcpRaw);
         packet.reset_data_len();
         self.socket_manager
             .try_send_to(packet.into_buffer(), &route.route_key())
@@ -34,7 +43,7 @@ impl TunnelRouter {
         let route = self.route_table.get_route_by_id(dest)?;
         let bytes_mut = BytesMut::zeroed(HEAD_LEN + buf.len());
         let mut packet = NetPacket::new(bytes_mut)?;
-        packet.set_protocol(ProtocolType::Raw);
+        packet.set_protocol(ProtocolType::KcpRaw);
         packet.reset_data_len();
         self.socket_manager
             .send_to(packet.into_buffer(), &route.route_key())
@@ -45,6 +54,7 @@ pub async fn dispatch(
     shutdown_manager: ShutdownManager<()>,
     mut tunnel_dispatcher: TunnelDispatcher,
     route_table: RouteTable<String>,
+    punch_context: Arc<PunchContext>,
 ) {
     loop {
         if shutdown_manager.is_shutdown_triggered() {
@@ -67,6 +77,7 @@ pub async fn dispatch(
             shutdown_manager.clone(),
             tunnel,
             route_table.clone(),
+            punch_context.clone(),
         ));
     }
 }
@@ -74,6 +85,7 @@ async fn tunnel_handle(
     shutdown_manager: ShutdownManager<()>,
     mut tunnel: Tunnel,
     route_table: RouteTable<String>,
+    punch_context: Arc<PunchContext>,
 ) {
     const BUF_SIZE: usize = 16;
     let mut bufs = Vec::with_capacity(BUF_SIZE);
@@ -106,9 +118,16 @@ async fn tunnel_handle(
         for index in 0..num {
             let len = sizes[index];
             let route_key = std::mem::take(&mut addrs[index]);
-            if let Err(e) = data_handle(&tunnel, &route_table, &bufs[index][..len], route_key).await
+            if let Err(e) = data_handle(
+                &tunnel,
+                &route_table,
+                &punch_context,
+                &bufs[index][..len],
+                route_key,
+            )
+            .await
             {
-                log::warn!("route_key={route_key:?},{e:?}");
+                log::warn!("data_handle route_key={route_key:?},{e:?}");
             }
         }
     }
@@ -116,17 +135,30 @@ async fn tunnel_handle(
 async fn data_handle(
     tunnel: &Tunnel,
     route_table: &RouteTable<String>,
+    punch_context: &PunchContext,
     buf: &[u8],
     route_key: RouteKey,
 ) -> io::Result<()> {
+    if rust_p2p_core::stun::is_stun_response(buf) {
+        if let Some(pub_addr) = rust_p2p_core::stun::recv_stun_response(buf) {
+            punch_context.update_public_addr(route_key.index(), pub_addr);
+            return Ok(());
+        }
+    }
     let packet = NetPacket::new(buf)?;
     let protocol_type = packet.protocol()?;
     match protocol_type {
         ProtocolType::Ping => {
             let (peer_id, time) = convert_ping_pong(packet.payload())?;
-            let packet = pong(peer_id, time)?;
+            if peer_id == &punch_context.oneself_id {
+                return Err(Error::new(
+                    io::ErrorKind::Other,
+                    "Cannot connect to oneself",
+                ));
+            }
             route_table
                 .add_route_if_absent(peer_id.to_string(), Route::from_default_rt(route_key, 0));
+            let packet = pong(&punch_context.oneself_id, time)?;
             tunnel
                 .send_to(packet.into_buffer(), route_key.addr())
                 .await?;
@@ -139,7 +171,13 @@ async fn data_handle(
                 Route::from(route_key, 0, now.saturating_sub(time)),
             );
         }
-        ProtocolType::Raw => {}
+        ProtocolType::KcpRaw => {
+            if let Some(peer_id) = route_table.get_id_by_route_key(&route_key) {
+                route_table
+                    .add_route_if_absent(peer_id.clone(), Route::from_default_rt(route_key, 0));
+                todo!("处理kcp数据")
+            }
+        }
     }
     Ok(())
 }

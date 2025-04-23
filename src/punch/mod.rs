@@ -1,14 +1,20 @@
-use crate::punch::protocol::ping;
+use crate::bytes_codec::BytesCodec;
+use crate::punch::kcp_stream::KcpStream;
+use crate::punch::maintain::start_task;
+use crate::punch::protocol::{ping, LengthPrefixedInitCodec};
 use crate::punch::tunnel::TunnelRouter;
+use async_shutdown::ShutdownManager;
 use bytes::{Buf, BytesMut};
 use kcp::Kcp;
 use parking_lot::{Mutex, RwLock};
 use rand::seq::SliceRandom;
+use rust_p2p_core::idle::IdleRouteManager;
 use rust_p2p_core::nat::{NatInfo, NatType};
 use rust_p2p_core::punch::{PunchInfo, Puncher as CorePuncher};
 use rust_p2p_core::route::route_table::RouteTable;
 use rust_p2p_core::route::Index;
 use rust_p2p_core::socket::LocalInterface;
+use rust_p2p_core::tunnel::config::{LoadBalance, TunnelConfig};
 use rust_p2p_core::tunnel::udp::{UDPIndex, WeakUdpTunnelSender};
 use rust_p2p_core::tunnel::SocketManager;
 use std::collections::HashMap;
@@ -22,11 +28,13 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::Interval;
 use tokio_util::sync::PollSender;
 
+mod kcp_stream;
 mod maintain;
 mod protocol;
 mod tunnel;
 
 pub(crate) struct PunchContext {
+    oneself_id: String,
     default_interface: Option<LocalInterface>,
     tcp_stun_servers: Vec<String>,
     udp_stun_servers: Vec<String>,
@@ -34,6 +42,7 @@ pub(crate) struct PunchContext {
 }
 impl PunchContext {
     pub fn new(
+        oneself_id: String,
         default_interface: Option<LocalInterface>,
         tcp_stun_servers: Vec<String>,
         udp_stun_servers: Vec<String>,
@@ -55,6 +64,7 @@ impl PunchContext {
             public_tcp_port: 0,
         };
         Self {
+            oneself_id,
             default_interface,
             tcp_stun_servers,
             udp_stun_servers,
@@ -161,47 +171,34 @@ pub struct Puncher {
     tunnel_router: TunnelRouter,
 }
 impl Puncher {
-    async fn new(
-        default_interface: Option<LocalInterface>,
-        tcp_stun_servers: Vec<String>,
-        udp_stun_servers: Vec<String>,
+    fn new(
+        punch_context: Arc<PunchContext>,
         puncher: CorePuncher,
         tunnel_router: TunnelRouter,
-    ) -> io::Result<Self> {
-        let socket_manager = &tunnel_router.socket_manager;
-        let local_tcp_port = if let Some(v) = socket_manager.tcp_socket_manager_as_ref() {
-            v.local_addr().port()
-        } else {
-            0
-        };
-        let local_udp_ports = if let Some(v) = socket_manager.udp_socket_manager_as_ref() {
-            v.local_ports()?
-        } else {
-            vec![]
-        };
-        let punch_context = Arc::new(PunchContext::new(
-            default_interface,
-            tcp_stun_servers,
-            udp_stun_servers,
-            local_udp_ports,
-            local_tcp_port,
-        ));
-        punch_context.update_local_addr().await;
-        Ok(Self {
+    ) -> Self {
+        Self {
             punch_context,
             puncher,
             tunnel_router,
-        })
+        }
     }
-
+    pub fn is_reachable(&self, peer_id: &String) -> bool {
+        self.tunnel_router.route_table.route_one(peer_id).is_some()
+    }
     pub async fn punch_conv(&self, peer_id: &String, punch_info: PunchInfo) -> io::Result<()> {
+        if peer_id == &self.punch_context.oneself_id {
+            return Err(Error::new(
+                io::ErrorKind::Other,
+                "Cannot connect to oneself",
+            ));
+        }
         if !self.puncher.need_punch(&punch_info) {
             return Ok(());
         }
         if self.tunnel_router.route_table.no_need_punch(peer_id) {
             return Ok(());
         }
-        let packet = ping(peer_id)?;
+        let packet = ping(&self.punch_context.oneself_id)?;
         self.puncher
             .punch_now(Some(packet.buffer()), packet.buffer(), punch_info)
             .await
@@ -209,174 +206,78 @@ impl Puncher {
     pub fn nat_info(&self) -> NatInfo {
         self.punch_context.nat_info()
     }
-    pub fn connect(&self, peer_id: &String) -> KcpStream {
+    pub fn connect(&self, peer_id: &String) -> io::Result<KcpStream> {
+        if peer_id == &self.punch_context.oneself_id {
+            return Err(Error::new(
+                io::ErrorKind::Other,
+                "Cannot connect to oneself",
+            ));
+        }
         todo!()
     }
 }
-type Map = Arc<RwLock<HashMap<(u32, u32), Sender<BytesMut>>>>;
-pub struct KcpStream {
-    peer_id: u32,
-    route_table: RouteTable<u32>,
-    sender: PollSender<BytesMut>,
-    receiver: Receiver<BytesMut>,
-}
 
-impl KcpStream {
-    pub(crate) fn new(
-        peer_id: u32,
-        conv: u32,
-        map: Map,
-        output_sender: Sender<(u32, BytesMut)>,
-    ) -> io::Result<Self> {
-        // let mut guard = map.write();
-        // if guard.contains_key(&(node_id, conv)) {
-        //     return Err(Error::new(
-        //         io::ErrorKind::AlreadyExists,
-        //         "stream already exists",
-        //     ));
-        // }
-        // let (input_sender, input_receiver) = tokio::sync::mpsc::channel(128);
-        // guard.insert((node_id, conv), input_sender);
-        // drop(guard);
-        // let stream = KcpStream::new_stream(node_id, conv, map, input_receiver, output_sender);
-        // Ok(stream)
-        todo!()
+pub async fn new_tunnel_component(oneself_id: String) -> io::Result<Puncher> {
+    if oneself_id.len() > 255 {
+        return Err(Error::new(
+            io::ErrorKind::InvalidInput,
+            "oneself_id too long",
+        ));
     }
-}
-impl KcpStream {
-    pub fn is_reachable(&self) -> bool {
-        self.route_table.route_one(&self.peer_id).is_some()
-    }
-}
+    let config = TunnelConfig::new(Box::new(LengthPrefixedInitCodec));
+    let (unified_tunnel_factory, puncher) = rust_p2p_core::tunnel::new_tunnel_component(config)?;
+    let route_table = RouteTable::<String>::new(LoadBalance::default());
+    let idle_route_manager = IdleRouteManager::new(Duration::from_secs(5), route_table.clone());
+    let shutdown_manager = ShutdownManager::new();
+    let socket_manager = unified_tunnel_factory.socket_manager();
+    let local_tcp_port = if let Some(v) = socket_manager.tcp_socket_manager_as_ref() {
+        v.local_addr().port()
+    } else {
+        0
+    };
+    let local_udp_ports = if let Some(v) = socket_manager.udp_socket_manager_as_ref() {
+        v.local_ports()?
+    } else {
+        vec![]
+    };
+    let punch_context = PunchContext::new(
+        oneself_id.clone(),
+        None,
+        vec![
+            "stun.flashdance.cx".to_string(),
+            "stun.sipnet.net".to_string(),
+            "stun.nextcloud.com:443".to_string(),
+        ],
+        vec![
+            "stun.miwifi.com".to_string(),
+            "stun.chat.bilibili.com".to_string(),
+            "stun.hitv.com".to_string(),
+            "stun.l.google.com:19302".to_string(),
+            "stun1.l.google.com:19302".to_string(),
+            "stun2.l.google.com:19302".to_string(),
+        ],
+        local_udp_ports,
+        local_tcp_port,
+    );
+    let punch_context = Arc::new(punch_context);
+    start_task(
+        oneself_id,
+        idle_route_manager,
+        shutdown_manager.clone(),
+        route_table.clone(),
+        punch_context.clone(),
+        socket_manager.clone(),
+    );
+    let tunnel_router = TunnelRouter::new(route_table.clone(), socket_manager);
 
-async fn kcp_run(
-    mut input: Receiver<BytesMut>,
-    mut kcp: Kcp<KcpOutput>,
-    mut data_out_receiver: Receiver<BytesMut>,
-    data_in_sender: Sender<BytesMut>,
-) -> io::Result<()> {
-    let mut interval = tokio::time::interval(Duration::from_millis(10));
-    let mut buf = [0; 65536];
-    let mut input_data = Option::<BytesMut>::None;
+    tokio::spawn(tunnel::dispatch(
+        shutdown_manager.clone(),
+        unified_tunnel_factory,
+        route_table,
+        punch_context.clone(),
+    ));
+    punch_context.update_local_addr().await;
+    let puncher = Puncher::new(punch_context, puncher, tunnel_router.clone());
 
-    loop {
-        let event = if kcp.wait_snd() >= kcp.snd_wnd() as usize {
-            input_event(&mut input, &mut interval).await?
-        } else if input_data.is_some() {
-            output_event(&mut data_out_receiver, &mut interval).await?
-        } else {
-            all_event(&mut input, &mut data_out_receiver, &mut interval).await?
-        };
-        if let Some(mut buf) = input_data.take() {
-            let len = kcp
-                .input(&buf)
-                .map_err(|e| Error::new(io::ErrorKind::Other, e))?;
-            if len < buf.len() {
-                buf.advance(len);
-                input_data.replace(buf);
-            }
-        }
-        match event {
-            Event::Input(mut buf) => {
-                let len = kcp
-                    .input(&buf)
-                    .map_err(|e| Error::new(io::ErrorKind::Other, e))?;
-                if len < buf.len() {
-                    buf.advance(len);
-                    input_data.replace(buf);
-                }
-            }
-            Event::Output(buf) => {
-                kcp.send(&buf)
-                    .map_err(|e| Error::new(io::ErrorKind::Other, e))?;
-            }
-            Event::Timeout => {
-                let now = std::time::SystemTime::now();
-                let millis = now
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                kcp.update(millis.as_millis() as _)
-                    .map_err(|e| Error::new(io::ErrorKind::Other, e))?;
-            }
-        }
-
-        if let Ok(len) = kcp.recv(&mut buf) {
-            if data_in_sender.send(buf[..len].into()).await.is_err() {
-                break;
-            }
-        }
-    }
-    Ok(())
+    Ok(puncher)
 }
-async fn all_event(
-    input: &mut Receiver<BytesMut>,
-    data_out_receiver: &mut Receiver<BytesMut>,
-    interval: &mut Interval,
-) -> io::Result<Event> {
-    tokio::select! {
-        rs=input.recv()=>{
-            let buf = rs.ok_or(Error::new(io::ErrorKind::Other, "input close"))?;
-            Ok(Event::Input(buf))
-        }
-        rs=data_out_receiver.recv()=>{
-            let buf = rs.ok_or(Error::new(io::ErrorKind::Other, "output close"))?;
-            Ok(Event::Output(buf))
-        }
-        _=interval.tick()=>{
-            Ok(Event::Timeout)
-        }
-    }
-}
-async fn input_event(input: &mut Receiver<BytesMut>, interval: &mut Interval) -> io::Result<Event> {
-    tokio::select! {
-        rs=input.recv()=>{
-            let buf = rs.ok_or(Error::new(io::ErrorKind::Other, "input close"))?;
-            Ok(Event::Input(buf))
-        }
-        _=interval.tick()=>{
-            Ok(Event::Timeout)
-        }
-    }
-}
-async fn output_event(
-    data_out_receiver: &mut Receiver<BytesMut>,
-    interval: &mut Interval,
-) -> io::Result<Event> {
-    tokio::select! {
-        rs=data_out_receiver.recv()=>{
-            let buf = rs.ok_or(Error::new(io::ErrorKind::Other, "output close"))?;
-            Ok(Event::Output(buf))
-        }
-        _=interval.tick()=>{
-            Ok(Event::Timeout)
-        }
-    }
-}
-#[derive(Debug)]
-enum Event {
-    Output(BytesMut),
-    Input(BytesMut),
-    Timeout,
-}
-
-struct KcpOutput {
-    peer_id: u32,
-    sender: Sender<(u32, BytesMut)>,
-}
-impl Write for KcpOutput {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Err(e) = self.sender.try_send((self.peer_id, buf.into())) {
-            match e {
-                TrySendError::Full(_) => {}
-                TrySendError::Closed(_) => return Err(Error::from(io::ErrorKind::WriteZero)),
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-pub async fn new_tunnel_component() {}
