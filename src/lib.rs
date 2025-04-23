@@ -58,6 +58,7 @@ pub use uuid;
 pub mod fingerprint;
 pub use flexi_logger;
 
+pub mod punch;
 pub type Stream = tcp::FramedStream;
 pub type SessionID = uuid::Uuid;
 
