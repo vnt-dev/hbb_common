@@ -1,3 +1,5 @@
+use crate::punch::protocol::ping;
+use crate::punch::tunnel::TunnelRouter;
 use bytes::{Buf, BytesMut};
 use kcp::Kcp;
 use parking_lot::{Mutex, RwLock};
@@ -19,11 +21,10 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::Interval;
 use tokio_util::sync::PollSender;
-use crate::punch::protocol::ping;
-use crate::punch::tunnel::TunnelRouter;
 
-mod tunnel;
+mod maintain;
 mod protocol;
+mod tunnel;
 
 pub(crate) struct PunchContext {
     default_interface: Option<LocalInterface>,
@@ -194,11 +195,10 @@ impl Puncher {
     }
 
     pub async fn punch_conv(&self, peer_id: &String, punch_info: PunchInfo) -> io::Result<()> {
-
         if !self.puncher.need_punch(&punch_info) {
             return Ok(());
         }
-        if self.tunnel_router.route_table.no_need_punch(peer_id){
+        if self.tunnel_router.route_table.no_need_punch(peer_id) {
             return Ok(());
         }
         let packet = ping(peer_id)?;

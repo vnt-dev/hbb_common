@@ -1,11 +1,12 @@
+use async_trait::async_trait;
+use bytes::{Buf, BufMut, BytesMut};
+use rust_p2p_core::tunnel::tcp::{Decoder, Encoder, InitCodec};
 use std::convert::{TryFrom, TryInto};
 use std::io;
 use std::io::IoSlice;
 use std::net::SocketAddr;
+use std::str::Utf8Error;
 use std::time::UNIX_EPOCH;
-use async_trait::async_trait;
-use bytes::{Buf, BufMut, BytesMut};
-use rust_p2p_core::tunnel::tcp::{Decoder, Encoder, InitCodec};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
@@ -64,7 +65,7 @@ impl Into<u8> for ProtocolType {
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
   protocol = ProtocolType::Raw
 */
-pub const HEAD_LEN:usize = 4;
+pub const HEAD_LEN: usize = 4;
 pub struct NetPacket<B> {
     buffer: B,
 }
@@ -98,6 +99,9 @@ impl<B: AsRef<[u8]>> NetPacket<B> {
     pub fn into_buffer(self) -> B {
         self.buffer
     }
+    pub fn payload(&self) -> &[u8] {
+        &self.buffer.as_ref()[HEAD_LEN..]
+    }
 }
 impl<B: AsRef<[u8]> + AsMut<[u8]>> NetPacket<B> {
     pub(crate) fn set_high_flag(&mut self) {
@@ -120,21 +124,48 @@ pub fn now() -> io::Result<u32> {
         .as_millis() as u32;
     Ok(time)
 }
-pub fn ping(peer_id:&String)->io::Result<NetPacket<BytesMut>>{
-    let bytes = peer_id.as_bytes();
-    if bytes.len()>255 {
+pub fn ping(self_id: &String) -> io::Result<NetPacket<BytesMut>> {
+    ping_pong_time(ProtocolType::Ping, self_id, now()?)
+}
+pub fn pong(self_id: &str, time: u32) -> io::Result<NetPacket<BytesMut>> {
+    ping_pong_time(ProtocolType::Pong, self_id, time)
+}
+pub fn ping_pong_time(
+    protocol_type: ProtocolType,
+    self_id: &str,
+    time: u32,
+) -> io::Result<NetPacket<BytesMut>> {
+    let bytes = self_id.as_bytes();
+    if bytes.len() > 255 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "too long"));
     }
     let mut bytes_mut = BytesMut::with_capacity(HEAD_LEN + 1 + bytes.len() + 4);
-    bytes_mut.resize(HEAD_LEN,0);
+    bytes_mut.resize(HEAD_LEN, 0);
     bytes_mut.put_u8(bytes.len() as u8);
     bytes_mut.put_slice(bytes);
-    bytes_mut.put_u32(now()?);
+    bytes_mut.put_u32(time);
     let mut packet = NetPacket::new(bytes_mut)?;
-    packet.set_protocol(ProtocolType::Ping);
+    packet.set_protocol(protocol_type);
     packet.reset_data_len();
     Ok(packet)
 }
+pub fn convert_ping_pong(payload: &[u8]) -> io::Result<(&str, u32)> {
+    if payload.len() < 5 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "too short"));
+    }
+    let end_index = payload[0] as usize + 1;
+    if end_index + 4 != payload.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid data"));
+    }
+    match std::str::from_utf8(&payload[1..end_index]) {
+        Ok(str) => {
+            let time = u32::from_be_bytes(payload[end_index..].try_into().unwrap());
+            Ok((str, time))
+        }
+        Err(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid data")),
+    }
+}
+
 pub struct LengthPrefixedEncoder {}
 
 pub struct LengthPrefixedDecoder {
