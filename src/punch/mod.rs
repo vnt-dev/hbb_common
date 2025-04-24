@@ -25,7 +25,7 @@ mod protocol;
 mod tunnel;
 
 pub(crate) struct PunchContext {
-    oneself_id: String,
+    oneself_id: Arc<String>,
     default_interface: Option<LocalInterface>,
     tcp_stun_servers: Vec<String>,
     udp_stun_servers: Vec<String>,
@@ -33,7 +33,7 @@ pub(crate) struct PunchContext {
 }
 impl PunchContext {
     pub fn new(
-        oneself_id: String,
+        oneself_id: Arc<String>,
         default_interface: Option<LocalInterface>,
         tcp_stun_servers: Vec<String>,
         udp_stun_servers: Vec<String>,
@@ -181,7 +181,7 @@ impl Puncher {
         self.punch_context.nat_info()
     }
     /// Initiate a hole punching attempt to the remote peer
-    pub async fn punch(&self, peer_id: &String, punch_info: PunchInfo) -> io::Result<()> {
+    pub async fn punch(&self, peer_id: &Arc<String>, punch_info: PunchInfo) -> io::Result<()> {
         if peer_id == &self.punch_context.oneself_id {
             return Err(Error::new(
                 io::ErrorKind::Other,
@@ -200,11 +200,11 @@ impl Puncher {
             .await
     }
     /// Verify peer reachability (successful hole punching)
-    pub fn is_reachable(&self, peer_id: &String) -> bool {
+    pub fn is_reachable(&self, peer_id: &Arc<String>) -> bool {
         self.tunnel_router.route_table.route_one(peer_id).is_some()
     }
     /// Connects to the peer after checking reachability using [`Self::is_reachable`].
-    pub fn connect(&self, peer_id: String) -> io::Result<KcpStream> {
+    pub fn connect(&self, peer_id: Arc<String>) -> io::Result<KcpStream> {
         if peer_id == self.punch_context.oneself_id {
             return Err(Error::new(
                 io::ErrorKind::Other,
@@ -223,9 +223,10 @@ pub async fn new_tunnel_component(oneself_id: String) -> io::Result<(Puncher, Kc
             "oneself_id too long",
         ));
     }
+    let oneself_id = Arc::new(oneself_id);
     let config = TunnelConfig::new(Box::new(LengthPrefixedInitCodec));
     let (unified_tunnel_factory, puncher) = rust_p2p_core::tunnel::new_tunnel_component(config)?;
-    let route_table = RouteTable::<String>::new(LoadBalance::default());
+    let route_table = RouteTable::new(LoadBalance::default());
     let idle_route_manager = IdleRouteManager::new(Duration::from_secs(5), route_table.clone());
     let shutdown_manager = ShutdownManager::new();
     let socket_manager = unified_tunnel_factory.socket_manager();

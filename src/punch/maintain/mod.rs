@@ -11,10 +11,10 @@ mod idle;
 mod nat_query;
 mod query_public_addr;
 pub fn start_task(
-    self_id: String,
-    idle_route_manager: IdleRouteManager<String>,
+    self_id: Arc<String>,
+    idle_route_manager: IdleRouteManager<Arc<String>>,
     shutdown_manager: ShutdownManager<()>,
-    route_table: RouteTable<String>,
+    route_table: RouteTable<Arc<String>>,
     punch_context: Arc<PunchContext>,
     socket_manager: SocketManager,
 ) {

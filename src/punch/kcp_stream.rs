@@ -126,7 +126,7 @@ enum Event {
 }
 
 struct KcpOutput {
-    peer_id: String,
+    peer_id: Arc<String>,
     tunnel_router: TunnelRouter,
 }
 impl Write for KcpOutput {
@@ -160,18 +160,18 @@ impl Counter {
 pub(crate) struct KcpContext {
     conv: Counter,
     map: Map,
-    sender: Sender<(String, BytesMut)>,
+    sender: Sender<(Arc<String>, BytesMut)>,
 }
 
 impl KcpContext {
-    fn new(sender: Sender<(String, BytesMut)>) -> Self {
+    fn new(sender: Sender<(Arc<String>, BytesMut)>) -> Self {
         Self {
             conv: Counter::new(rand::random()),
             map: Arc::new(Default::default()),
             sender,
         }
     }
-    pub(crate) async fn input(&self, buf: &[u8], peer_id: String) {
+    pub(crate) async fn input(&self, buf: &[u8], peer_id: Arc<String>) {
         if buf.is_empty() {
             return;
         }
@@ -191,23 +191,23 @@ impl KcpContext {
     pub(crate) fn new_stream(
         &self,
         output: TunnelRouter,
-        peer_id: String,
+        peer_id: Arc<String>,
     ) -> io::Result<KcpStream> {
         KcpStream::new(peer_id, self.conv.add(), self.map.clone(), output)
     }
 }
 
-type Map = Arc<RwLock<HashMap<(String, u32), Sender<BytesMut>>>>;
+type Map = Arc<RwLock<HashMap<(Arc<String>, u32), Sender<BytesMut>>>>;
 
 pub struct KcpStream {
-    peer_id: String,
+    peer_id: Arc<String>,
     conv: u32,
     read: KcpStreamRead,
     write: KcpStreamWrite,
 }
 impl KcpStream {
     pub(crate) fn new(
-        peer_id: String,
+        peer_id: Arc<String>,
         conv: u32,
         map: Map,
         tunnel_router: TunnelRouter,
@@ -232,7 +232,7 @@ impl KcpStream {
         Ok(stream)
     }
     fn new_stream(
-        peer_id: String,
+        peer_id: Arc<String>,
         conv: u32,
         owned_kcp: OwnedKcp,
         input: Receiver<BytesMut>,
@@ -275,7 +275,7 @@ impl KcpStream {
 }
 struct OwnedKcp {
     map: Map,
-    key: (String, u32),
+    key: (Arc<String>, u32),
 }
 impl Drop for OwnedKcp {
     fn drop(&mut self) {
@@ -372,7 +372,7 @@ impl KcpStream {
 }
 
 pub struct KcpStreamListener {
-    input_receiver: Receiver<(String, BytesMut)>,
+    input_receiver: Receiver<(Arc<String>, BytesMut)>,
     map: Map,
     output: TunnelRouter,
 }
@@ -387,7 +387,7 @@ impl KcpStreamListener {
         };
         (kcp_context, listener)
     }
-    pub async fn accept(&mut self) -> io::Result<(KcpStream, String)> {
+    pub async fn accept(&mut self) -> io::Result<(KcpStream, Arc<String>)> {
         loop {
             let (peer_id, bytes) = self
                 .input_receiver
@@ -411,12 +411,12 @@ impl KcpStreamListener {
             }
         }
     }
-    fn new_stream_impl(&self, peer_id: String, conv: u32) -> io::Result<KcpStream> {
+    fn new_stream_impl(&self, peer_id: Arc<String>, conv: u32) -> io::Result<KcpStream> {
         KcpStream::new(peer_id, conv, self.map.clone(), self.output.clone())
     }
     async fn send_data_to_kcp(
         &self,
-        peer_id: String,
+        peer_id: Arc<String>,
         conv: u32,
         bytes_mut: BytesMut,
     ) -> io::Result<()> {
@@ -426,7 +426,7 @@ impl KcpStreamListener {
             .await
             .map_err(|_| Error::new(io::ErrorKind::NotFound, "not found stream"))
     }
-    fn get_stream_sender(&self, peer_id: String, conv: u32) -> io::Result<Sender<BytesMut>> {
+    fn get_stream_sender(&self, peer_id: Arc<String>, conv: u32) -> io::Result<Sender<BytesMut>> {
         if let Some(v) = self.map.read().get(&(peer_id, conv)) {
             Ok(v.clone())
         } else {

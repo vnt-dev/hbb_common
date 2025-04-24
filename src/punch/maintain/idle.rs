@@ -1,4 +1,8 @@
-pub async fn idle_check_loop(idle_route_manager: rust_p2p_core::idle::IdleRouteManager<String>) {
+use std::sync::Arc;
+
+pub async fn idle_check_loop(
+    idle_route_manager: rust_p2p_core::idle::IdleRouteManager<Arc<String>>,
+) {
     loop {
         let (peer_id, route, _) = idle_route_manager.next_idle().await;
         idle_route_manager.remove_route(&peer_id, &route.route_key());

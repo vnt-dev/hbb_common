@@ -1,7 +1,5 @@
 use crate::punch::kcp_stream::KcpContext;
-use crate::punch::protocol::{
-    convert_ping_pong, now, ping, pong, NetPacket, ProtocolType, HEAD_LEN,
-};
+use crate::punch::protocol::{convert_ping_pong, now, pong, NetPacket, ProtocolType, HEAD_LEN};
 use crate::punch::PunchContext;
 use async_shutdown::ShutdownManager;
 use bytes::BytesMut;
@@ -14,25 +12,19 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct TunnelRouter {
-    pub(crate) route_table: RouteTable<String>,
+    pub(crate) route_table: RouteTable<Arc<String>>,
     pub(crate) socket_manager: SocketManager,
 }
 
 impl TunnelRouter {
-    pub(crate) fn new(route_table: RouteTable<String>, socket_manager: SocketManager) -> Self {
+    pub(crate) fn new(route_table: RouteTable<Arc<String>>, socket_manager: SocketManager) -> Self {
         Self {
             route_table,
             socket_manager,
         }
     }
-    #[allow(dead_code)]
-    pub fn ping(&self, dest: &String) -> io::Result<()> {
-        let route = self.route_table.get_route_by_id(dest)?;
-        let packet = ping(dest)?;
-        self.socket_manager
-            .try_send_to(packet.into_buffer(), &route.route_key())
-    }
-    pub fn try_send_to(&self, buf: &[u8], dest: &String) -> io::Result<()> {
+
+    pub fn try_send_to(&self, buf: &[u8], dest: &Arc<String>) -> io::Result<()> {
         let route = self.route_table.get_route_by_id(dest)?;
         let bytes_mut = BytesMut::zeroed(HEAD_LEN + buf.len());
         let mut packet = NetPacket::new(bytes_mut)?;
@@ -42,7 +34,7 @@ impl TunnelRouter {
             .try_send_to(packet.into_buffer(), &route.route_key())
     }
     #[allow(dead_code)]
-    pub async fn send_to(&self, buf: &[u8], dest: &String) -> io::Result<()> {
+    pub async fn send_to(&self, buf: &[u8], dest: &Arc<String>) -> io::Result<()> {
         let route = self.route_table.get_route_by_id(dest)?;
         let bytes_mut = BytesMut::zeroed(HEAD_LEN + buf.len());
         let mut packet = NetPacket::new(bytes_mut)?;
@@ -56,7 +48,7 @@ impl TunnelRouter {
 pub async fn dispatch(
     shutdown_manager: ShutdownManager<()>,
     mut tunnel_dispatcher: TunnelDispatcher,
-    route_table: RouteTable<String>,
+    route_table: RouteTable<Arc<String>>,
     punch_context: Arc<PunchContext>,
     kcp_context: KcpContext,
 ) {
@@ -89,7 +81,7 @@ pub async fn dispatch(
 async fn tunnel_handle(
     shutdown_manager: ShutdownManager<()>,
     mut tunnel: Tunnel,
-    route_table: RouteTable<String>,
+    route_table: RouteTable<Arc<String>>,
     punch_context: Arc<PunchContext>,
     kcp_context: KcpContext,
 ) {
@@ -141,7 +133,7 @@ async fn tunnel_handle(
 }
 async fn data_handle(
     tunnel: &Tunnel,
-    route_table: &RouteTable<String>,
+    route_table: &RouteTable<Arc<String>>,
     punch_context: &PunchContext,
     buf: &[u8],
     route_key: RouteKey,
@@ -158,14 +150,16 @@ async fn data_handle(
     match protocol_type {
         ProtocolType::Ping => {
             let (peer_id, time) = convert_ping_pong(packet.payload())?;
-            if peer_id == &punch_context.oneself_id {
+            if peer_id == punch_context.oneself_id.as_str() {
                 return Err(Error::new(
                     io::ErrorKind::Other,
                     "Cannot connect to oneself",
                 ));
             }
-            route_table
-                .add_route_if_absent(peer_id.to_string(), Route::from_default_rt(route_key, 0));
+            route_table.add_route_if_absent(
+                Arc::new(peer_id.to_string()),
+                Route::from_default_rt(route_key, 0),
+            );
             let packet = pong(&punch_context.oneself_id, time)?;
             tunnel
                 .send_to(packet.into_buffer(), route_key.addr())
@@ -175,7 +169,7 @@ async fn data_handle(
             let (peer_id, time) = convert_ping_pong(packet.payload())?;
             let now = now()?;
             route_table.add_route(
-                peer_id.to_string(),
+                Arc::new(peer_id.to_string()),
                 Route::from(route_key, 0, now.saturating_sub(time)),
             );
         }

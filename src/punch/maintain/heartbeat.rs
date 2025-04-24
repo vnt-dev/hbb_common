@@ -1,11 +1,12 @@
 use crate::punch::protocol::ping;
 use rust_p2p_core::route::route_table::RouteTable;
 use rust_p2p_core::tunnel::SocketManager;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub async fn heartbeat_loop(
-    oneself_id: String,
-    route_table: RouteTable<String>,
+    oneself_id: Arc<String>,
+    route_table: RouteTable<Arc<String>>,
     socket_manager: SocketManager,
 ) {
     loop {
@@ -16,7 +17,7 @@ pub async fn heartbeat_loop(
 
 pub async fn heartbeat(
     oneself_id: &String,
-    route_table: &RouteTable<String>,
+    route_table: &RouteTable<Arc<String>>,
     socket_manager: &SocketManager,
 ) {
     let table = route_table.route_table();
