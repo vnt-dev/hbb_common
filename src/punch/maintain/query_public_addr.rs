@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
-use crate::punch::{PunchContext, Puncher};
+use crate::punch::PunchContext;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(crate) async fn query_tcp_public_addr_loop(

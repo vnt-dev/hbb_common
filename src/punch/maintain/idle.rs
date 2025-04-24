@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 pub async fn idle_check_loop(idle_route_manager: rust_p2p_core::idle::IdleRouteManager<String>) {
     loop {
         let (peer_id, route, _) = idle_route_manager.next_idle().await;

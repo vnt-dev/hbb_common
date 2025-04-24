@@ -1,4 +1,4 @@
-use crate::punch::{PunchContext, Puncher};
+use crate::punch::PunchContext;
 use rust_p2p_core::nat::NatType;
 use rust_p2p_core::tunnel::udp::Model;
 use rust_p2p_core::tunnel::SocketManager;

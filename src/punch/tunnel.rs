@@ -1,3 +1,4 @@
+use crate::punch::kcp_stream::KcpContext;
 use crate::punch::protocol::{
     convert_ping_pong, now, ping, pong, NetPacket, ProtocolType, HEAD_LEN,
 };
@@ -24,6 +25,7 @@ impl TunnelRouter {
             socket_manager,
         }
     }
+    #[allow(dead_code)]
     pub fn ping(&self, dest: &String) -> io::Result<()> {
         let route = self.route_table.get_route_by_id(dest)?;
         let packet = ping(dest)?;
@@ -39,6 +41,7 @@ impl TunnelRouter {
         self.socket_manager
             .try_send_to(packet.into_buffer(), &route.route_key())
     }
+    #[allow(dead_code)]
     pub async fn send_to(&self, buf: &[u8], dest: &String) -> io::Result<()> {
         let route = self.route_table.get_route_by_id(dest)?;
         let bytes_mut = BytesMut::zeroed(HEAD_LEN + buf.len());
@@ -55,6 +58,7 @@ pub async fn dispatch(
     mut tunnel_dispatcher: TunnelDispatcher,
     route_table: RouteTable<String>,
     punch_context: Arc<PunchContext>,
+    kcp_context: KcpContext,
 ) {
     loop {
         if shutdown_manager.is_shutdown_triggered() {
@@ -78,6 +82,7 @@ pub async fn dispatch(
             tunnel,
             route_table.clone(),
             punch_context.clone(),
+            kcp_context.clone(),
         ));
     }
 }
@@ -86,6 +91,7 @@ async fn tunnel_handle(
     mut tunnel: Tunnel,
     route_table: RouteTable<String>,
     punch_context: Arc<PunchContext>,
+    kcp_context: KcpContext,
 ) {
     const BUF_SIZE: usize = 16;
     let mut bufs = Vec::with_capacity(BUF_SIZE);
@@ -124,6 +130,7 @@ async fn tunnel_handle(
                 &punch_context,
                 &bufs[index][..len],
                 route_key,
+                &kcp_context,
             )
             .await
             {
@@ -138,6 +145,7 @@ async fn data_handle(
     punch_context: &PunchContext,
     buf: &[u8],
     route_key: RouteKey,
+    kcp_context: &KcpContext,
 ) -> io::Result<()> {
     if rust_p2p_core::stun::is_stun_response(buf) {
         if let Some(pub_addr) = rust_p2p_core::stun::recv_stun_response(buf) {
@@ -175,7 +183,7 @@ async fn data_handle(
             if let Some(peer_id) = route_table.get_id_by_route_key(&route_key) {
                 route_table
                     .add_route_if_absent(peer_id.clone(), Route::from_default_rt(route_key, 0));
-                todo!("处理kcp数据")
+                kcp_context.input(packet.payload(), peer_id).await;
             }
         }
     }

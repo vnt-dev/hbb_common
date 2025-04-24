@@ -1,12 +1,9 @@
-use crate::bytes_codec::BytesCodec;
-use crate::punch::kcp_stream::KcpStream;
+use crate::punch::kcp_stream::{KcpContext, KcpStream, KcpStreamListener};
 use crate::punch::maintain::start_task;
 use crate::punch::protocol::{ping, LengthPrefixedInitCodec};
 use crate::punch::tunnel::TunnelRouter;
 use async_shutdown::ShutdownManager;
-use bytes::{Buf, BytesMut};
-use kcp::Kcp;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use rand::seq::SliceRandom;
 use rust_p2p_core::idle::IdleRouteManager;
 use rust_p2p_core::nat::{NatInfo, NatType};
@@ -15,18 +12,12 @@ use rust_p2p_core::route::route_table::RouteTable;
 use rust_p2p_core::route::Index;
 use rust_p2p_core::socket::LocalInterface;
 use rust_p2p_core::tunnel::config::{LoadBalance, TunnelConfig};
-use rust_p2p_core::tunnel::udp::{UDPIndex, WeakUdpTunnelSender};
-use rust_p2p_core::tunnel::SocketManager;
-use std::collections::HashMap;
+use rust_p2p_core::tunnel::udp::UDPIndex;
 use std::io;
-use std::io::{Error, Write};
+use std::io::Error;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time::Interval;
-use tokio_util::sync::PollSender;
 
 mod kcp_stream;
 mod maintain;
@@ -169,23 +160,28 @@ pub struct Puncher {
     punch_context: Arc<PunchContext>,
     puncher: CorePuncher,
     tunnel_router: TunnelRouter,
+    kcp_context: KcpContext,
 }
 impl Puncher {
     fn new(
         punch_context: Arc<PunchContext>,
         puncher: CorePuncher,
         tunnel_router: TunnelRouter,
+        kcp_context: KcpContext,
     ) -> Self {
         Self {
             punch_context,
             puncher,
             tunnel_router,
+            kcp_context,
         }
     }
-    pub fn is_reachable(&self, peer_id: &String) -> bool {
-        self.tunnel_router.route_table.route_one(peer_id).is_some()
+    /// Get current NAT information
+    pub fn nat_info(&self) -> NatInfo {
+        self.punch_context.nat_info()
     }
-    pub async fn punch_conv(&self, peer_id: &String, punch_info: PunchInfo) -> io::Result<()> {
+    /// Initiate a hole punching attempt to the remote peer
+    pub async fn punch(&self, peer_id: &String, punch_info: PunchInfo) -> io::Result<()> {
         if peer_id == &self.punch_context.oneself_id {
             return Err(Error::new(
                 io::ErrorKind::Other,
@@ -203,21 +199,24 @@ impl Puncher {
             .punch_now(Some(packet.buffer()), packet.buffer(), punch_info)
             .await
     }
-    pub fn nat_info(&self) -> NatInfo {
-        self.punch_context.nat_info()
+    /// Verify peer reachability (successful hole punching)
+    pub fn is_reachable(&self, peer_id: &String) -> bool {
+        self.tunnel_router.route_table.route_one(peer_id).is_some()
     }
-    pub fn connect(&self, peer_id: &String) -> io::Result<KcpStream> {
-        if peer_id == &self.punch_context.oneself_id {
+    /// Connects to the peer after checking reachability using [`Self::is_reachable`].
+    pub fn connect(&self, peer_id: String) -> io::Result<KcpStream> {
+        if peer_id == self.punch_context.oneself_id {
             return Err(Error::new(
                 io::ErrorKind::Other,
                 "Cannot connect to oneself",
             ));
         }
-        todo!()
+        self.kcp_context
+            .new_stream(self.tunnel_router.clone(), peer_id)
     }
 }
 
-pub async fn new_tunnel_component(oneself_id: String) -> io::Result<Puncher> {
+pub async fn new_tunnel_component(oneself_id: String) -> io::Result<(Puncher, KcpStreamListener)> {
     if oneself_id.len() > 255 {
         return Err(Error::new(
             io::ErrorKind::InvalidInput,
@@ -269,15 +268,17 @@ pub async fn new_tunnel_component(oneself_id: String) -> io::Result<Puncher> {
         socket_manager.clone(),
     );
     let tunnel_router = TunnelRouter::new(route_table.clone(), socket_manager);
+    let (kcp_context, kcp_listener) = KcpStreamListener::new(tunnel_router.clone());
 
     tokio::spawn(tunnel::dispatch(
         shutdown_manager.clone(),
         unified_tunnel_factory,
         route_table,
         punch_context.clone(),
+        kcp_context.clone(),
     ));
     punch_context.update_local_addr().await;
-    let puncher = Puncher::new(punch_context, puncher, tunnel_router.clone());
+    let puncher = Puncher::new(punch_context, puncher, tunnel_router.clone(), kcp_context);
 
-    Ok(puncher)
+    Ok((puncher, kcp_listener))
 }

@@ -2,11 +2,11 @@ use crate::punch::tunnel::TunnelRouter;
 use bytes::{Buf, BytesMut};
 use kcp::Kcp;
 use parking_lot::RwLock;
-use rust_p2p_core::route::route_table::RouteTable;
 use std::collections::HashMap;
 use std::io;
 use std::io::{Error, Write};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -140,6 +140,60 @@ impl Write for KcpOutput {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+#[derive(Clone)]
+struct Counter {
+    counter: Arc<AtomicU32>,
+}
+impl Counter {
+    fn new(v: u32) -> Self {
+        Self {
+            counter: Arc::new(AtomicU32::new(v)),
+        }
+    }
+    fn add(&self) -> u32 {
+        self.counter.fetch_add(1, Ordering::Relaxed)
+    }
+}
+#[derive(Clone)]
+pub(crate) struct KcpContext {
+    conv: Counter,
+    map: Map,
+    sender: Sender<(String, BytesMut)>,
+}
+
+impl KcpContext {
+    fn new(sender: Sender<(String, BytesMut)>) -> Self {
+        Self {
+            conv: Counter::new(rand::random()),
+            map: Arc::new(Default::default()),
+            sender,
+        }
+    }
+    pub(crate) async fn input(&self, buf: &[u8], peer_id: String) {
+        if buf.is_empty() {
+            return;
+        }
+        let conv = kcp::get_conv(buf);
+        let key = (peer_id, conv);
+        let option = self.map.read().get(&key).cloned();
+        if let Some(v) = option {
+            if v.send(buf.into()).await.is_ok() {
+                return;
+            }
+        }
+
+        if self.sender.send((key.0, buf.into())).await.is_err() {
+            log::warn!("input error");
+        }
+    }
+    pub(crate) fn new_stream(
+        &self,
+        output: TunnelRouter,
+        peer_id: String,
+    ) -> io::Result<KcpStream> {
+        KcpStream::new(peer_id, self.conv.add(), self.map.clone(), output)
     }
 }
 
@@ -311,5 +365,72 @@ impl KcpStream {
     }
     pub fn conv(&self) -> u32 {
         self.conv
+    }
+    pub fn peer_id(&self) -> &String {
+        &self.peer_id
+    }
+}
+
+pub struct KcpStreamListener {
+    input_receiver: Receiver<(String, BytesMut)>,
+    map: Map,
+    output: TunnelRouter,
+}
+impl KcpStreamListener {
+    pub(crate) fn new(output: TunnelRouter) -> (KcpContext, Self) {
+        let (sender, input_receiver) = tokio::sync::mpsc::channel(128);
+        let kcp_context = KcpContext::new(sender);
+        let listener = KcpStreamListener {
+            input_receiver,
+            map: kcp_context.map.clone(),
+            output,
+        };
+        (kcp_context, listener)
+    }
+    pub async fn accept(&mut self) -> io::Result<(KcpStream, String)> {
+        loop {
+            let (peer_id, bytes) = self
+                .input_receiver
+                .recv()
+                .await
+                .ok_or_else(|| io::Error::from(io::ErrorKind::Other))?;
+            if bytes.is_empty() {
+                continue;
+            }
+            let conv = kcp::get_conv(&bytes);
+            match self.new_stream_impl(peer_id.clone(), conv) {
+                Ok(stream) => {
+                    self.send_data_to_kcp(peer_id.clone(), conv, bytes).await?;
+                    return Ok((stream, peer_id));
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::AlreadyExists {
+                        self.send_data_to_kcp(peer_id, conv, bytes).await?;
+                    }
+                }
+            }
+        }
+    }
+    fn new_stream_impl(&self, peer_id: String, conv: u32) -> io::Result<KcpStream> {
+        KcpStream::new(peer_id, conv, self.map.clone(), self.output.clone())
+    }
+    async fn send_data_to_kcp(
+        &self,
+        peer_id: String,
+        conv: u32,
+        bytes_mut: BytesMut,
+    ) -> io::Result<()> {
+        let sender = self.get_stream_sender(peer_id, conv)?;
+        sender
+            .send(bytes_mut)
+            .await
+            .map_err(|_| Error::new(io::ErrorKind::NotFound, "not found stream"))
+    }
+    fn get_stream_sender(&self, peer_id: String, conv: u32) -> io::Result<Sender<BytesMut>> {
+        if let Some(v) = self.map.read().get(&(peer_id, conv)) {
+            Ok(v.clone())
+        } else {
+            Err(Error::new(io::ErrorKind::NotFound, "not found stream"))
+        }
     }
 }
