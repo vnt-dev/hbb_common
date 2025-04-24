@@ -23,6 +23,7 @@ mod kcp_stream;
 mod maintain;
 mod protocol;
 mod tunnel;
+pub use kcp_stream::*;
 
 pub(crate) struct PunchContext {
     oneself_id: Arc<String>,
