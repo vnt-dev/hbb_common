@@ -1,285 +1,177 @@
-use crate::punch::maintain::start_task;
-use crate::punch::protocol::{ping, LengthPrefixedInitCodec};
-use crate::punch::tunnel::TunnelRouter;
-use async_shutdown::ShutdownManager;
-use parking_lot::Mutex;
-use rand::seq::SliceRandom;
-use rust_p2p_core::idle::IdleRouteManager;
-use rust_p2p_core::nat::{NatInfo, NatType};
-use rust_p2p_core::punch::{PunchInfo, Puncher as CorePuncher};
-use rust_p2p_core::route::route_table::RouteTable;
-use rust_p2p_core::route::Index;
-use rust_p2p_core::socket::LocalInterface;
-use rust_p2p_core::tunnel::config::{LoadBalance, TunnelConfig};
-use rust_p2p_core::tunnel::udp::UDPIndex;
-use std::io;
-use std::io::Error;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
-
 mod kcp_stream;
 mod maintain;
 mod protocol;
+mod punch;
 mod tunnel;
+
+use crate::bytes_codec::BytesCodec;
+use crate::config::Socks5Server;
+use crate::tcp::DynTcpStream;
+use crate::{tcp, ResultType};
+use bytes::Bytes;
 pub use kcp_stream::*;
+pub use punch::*;
+use sodiumoxide::crypto::secretbox::Key;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::ToSocketAddrs;
+use tokio_socks::IntoTargetAddr;
+use tokio_util::codec::Framed;
 
-pub(crate) struct PunchContext {
-    oneself_id: Arc<String>,
-    default_interface: Option<LocalInterface>,
-    tcp_stun_servers: Vec<String>,
-    udp_stun_servers: Vec<String>,
-    nat_info: Arc<Mutex<NatInfo>>,
+pub struct ClientFramedStream {
+    peer_id: Arc<String>,
+    puncher: Puncher,
+    // Channel relayed from the server
+    relay_framed: tcp::FramedStream,
+    // directly connected KCP channel and reuse the FramedStream structure
+    kcp_framed: Option<tcp::FramedStream>,
 }
-impl PunchContext {
-    pub fn new(
-        oneself_id: Arc<String>,
-        default_interface: Option<LocalInterface>,
-        tcp_stun_servers: Vec<String>,
-        udp_stun_servers: Vec<String>,
-        local_udp_ports: Vec<u16>,
-        local_tcp_port: u16,
-    ) -> Self {
-        let public_udp_ports = vec![0; local_udp_ports.len()];
-        let nat_info = NatInfo {
-            nat_type: Default::default(),
-            public_ips: vec![],
-            public_udp_ports,
-            mapping_tcp_addr: vec![],
-            mapping_udp_addr: vec![],
-            public_port_range: 0,
-            local_ipv4: Ipv4Addr::UNSPECIFIED,
-            ipv6: None,
-            local_udp_ports,
-            local_tcp_port,
-            public_tcp_port: 0,
-        };
-        Self {
-            oneself_id,
-            default_interface,
-            tcp_stun_servers,
-            udp_stun_servers,
-            nat_info: Arc::new(Mutex::new(nat_info)),
-        }
+impl ClientFramedStream {
+    pub async fn new<T: ToSocketAddrs + std::fmt::Display>(
+        puncher: Puncher,
+        peer_id: Arc<String>,
+        remote_addr: T,
+        local_addr: Option<SocketAddr>,
+        ms_timeout: u64,
+    ) -> ResultType<Self> {
+        let relay_framed = tcp::FramedStream::new(remote_addr, local_addr, ms_timeout).await?;
+        Ok(Self {
+            peer_id,
+            puncher,
+            relay_framed,
+            kcp_framed: None,
+        })
     }
-    pub fn set_public_info(
-        &self,
-        nat_type: NatType,
-        mut ips: Vec<Ipv4Addr>,
-        public_port_range: u16,
-    ) {
-        ips.retain(rust_p2p_core::extend::addr::is_ipv4_global);
-        let mut guard = self.nat_info.lock();
-        guard.public_ips = ips;
-        guard.nat_type = nat_type;
-        guard.public_port_range = public_port_range;
+    pub async fn connect<'t, T>(
+        puncher: Puncher,
+        peer_id: Arc<String>,
+        target: T,
+        local_addr: Option<SocketAddr>,
+        proxy_conf: &Socks5Server,
+        ms_timeout: u64,
+    ) -> ResultType<Self>
+    where
+        T: IntoTargetAddr<'t>,
+    {
+        let relay_framed =
+            tcp::FramedStream::connect(target, local_addr, proxy_conf, ms_timeout).await?;
+        Ok(Self {
+            peer_id,
+            puncher,
+            relay_framed,
+            kcp_framed: None,
+        })
     }
-    fn mapping_addr(addr: SocketAddr) -> Option<(Ipv4Addr, u16)> {
-        match addr {
-            SocketAddr::V4(addr) => Some((*addr.ip(), addr.port())),
-            SocketAddr::V6(addr) => addr.ip().to_ipv4_mapped().map(|ip| (ip, addr.port())),
-        }
-    }
-    pub fn update_tcp_public_addr(&self, addr: SocketAddr) {
-        let (ip, port) = if let Some(r) = Self::mapping_addr(addr) {
-            r
-        } else {
+    fn try_create_kcp_stream(&mut self) {
+        if self.kcp_framed.is_some() {
             return;
-        };
-        let mut nat_info = self.nat_info.lock();
-        if rust_p2p_core::extend::addr::is_ipv4_global(&ip) && !nat_info.public_ips.contains(&ip) {
-            nat_info.public_ips.push(ip);
         }
-        nat_info.public_tcp_port = port;
-    }
-    pub fn update_public_addr(&self, index: Index, addr: SocketAddr) {
-        let (ip, port) = if let Some(r) = Self::mapping_addr(addr) {
-            r
-        } else {
-            return;
-        };
-        let mut nat_info = self.nat_info.lock();
-
-        if rust_p2p_core::extend::addr::is_ipv4_global(&ip) {
-            if !nat_info.public_ips.contains(&ip) {
-                nat_info.public_ips.push(ip);
+        if self.puncher.is_reachable(&self.peer_id) {
+            if let Ok(stream) = self.puncher.connect(self.peer_id.clone()) {
+                self.kcp_framed.replace(tcp::FramedStream(
+                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+                    self.relay_framed.local_addr(),
+                    None,
+                    0,
+                ));
             }
-            match index {
-                Index::Udp(index) => {
-                    let index = match index {
-                        UDPIndex::MainV4(index) => index,
-                        UDPIndex::MainV6(index) => index,
-                        UDPIndex::SubV4(_) => return,
-                    };
-                    if let Some(p) = nat_info.public_udp_ports.get_mut(index) {
-                        *p = port;
+        }
+    }
+}
+impl ClientFramedStream {
+    pub fn set_send_timeout(&mut self, ms: u64) {
+        self.relay_framed.set_send_timeout(ms);
+        if let Some(kcp_framed) = self.kcp_framed.as_mut() {
+            kcp_framed.set_send_timeout(ms);
+        }
+    }
+    pub fn set_raw(&mut self) {
+        self.relay_framed.set_raw();
+        if let Some(kcp_framed) = self.kcp_framed.as_mut() {
+            kcp_framed.set_raw();
+        }
+    }
+    pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
+        self.try_create_kcp_stream();
+        if let Some(kcp_framed) = self.kcp_framed.as_mut() {
+            if self.puncher.is_reachable(&self.peer_id)
+                && kcp_framed.send_bytes(bytes.clone()).await.is_ok()
+            {
+                return Ok(());
+            }
+            self.kcp_framed.take();
+        }
+        self.relay_framed.send_bytes(bytes).await
+    }
+    pub async fn send_raw(&mut self, msg: Vec<u8>) -> ResultType<()> {
+        self.try_create_kcp_stream();
+        if let Some(kcp_framed) = self.kcp_framed.as_mut() {
+            if self.puncher.is_reachable(&self.peer_id)
+                && kcp_framed.send_raw(msg.clone()).await.is_ok()
+            {
+                return Ok(());
+            }
+            self.kcp_framed.take();
+        }
+        self.relay_framed.send_raw(msg).await
+    }
+    pub fn set_key(&mut self, key: Key) {
+        self.relay_framed.set_key(key.clone());
+        if let Some(kcp_framed) = self.kcp_framed.as_mut() {
+            kcp_framed.set_key(key);
+        }
+    }
+    pub fn is_secured(&self) -> bool {
+        self.relay_framed.is_secured()
+    }
+    pub async fn next_timeout(
+        &mut self,
+        timeout: u64,
+    ) -> Option<Result<bytes::BytesMut, std::io::Error>> {
+        loop {
+            if let Some(kcp_framed) = self.kcp_framed.as_mut() {
+                tokio::select! {
+                    rs=kcp_framed.next_timeout(timeout)=>{
+                        if let Some(Ok(rs)) = rs{
+                            return Some(Ok(rs));
+                        }
+                        self.kcp_framed.take();
+                    }
+                    rs=self.relay_framed.next_timeout(timeout)=>{
+                        return rs;
                     }
                 }
-                Index::Tcp(_) => {
-                    nat_info.public_tcp_port = port;
-                }
-                _ => {}
             }
-        } else {
-            log::debug!("not public addr: {addr:?}")
         }
     }
-    pub async fn update_local_addr(&self) {
-        let local_ipv4 = rust_p2p_core::extend::addr::local_ipv4().await;
-        let local_ipv6 = rust_p2p_core::extend::addr::local_ipv6().await;
-        let mut nat_info = self.nat_info.lock();
-        if let Ok(local_ipv4) = local_ipv4 {
-            nat_info.local_ipv4 = local_ipv4;
+    pub async fn send(&mut self, msg: &impl protobuf::Message) -> ResultType<()> {
+        self.try_create_kcp_stream();
+        if let Some(kcp_framed) = self.kcp_framed.as_mut() {
+            if self.puncher.is_reachable(&self.peer_id) && kcp_framed.send(msg).await.is_ok() {
+                return Ok(());
+            }
+            self.kcp_framed.take();
         }
-        nat_info.ipv6 = local_ipv6.ok();
+        self.relay_framed.send(msg).await
     }
-    pub async fn update_nat_info(&self) -> io::Result<NatInfo> {
-        self.update_local_addr().await;
-        let mut udp_stun_servers = self.udp_stun_servers.clone();
-        udp_stun_servers.shuffle(&mut rand::thread_rng());
-        let udp_stun_servers = if udp_stun_servers.len() > 3 {
-            &udp_stun_servers[..3]
-        } else {
-            &udp_stun_servers
-        };
-        let (nat_type, ips, port_range) = rust_p2p_core::stun::stun_test_nat(
-            udp_stun_servers.to_vec(),
-            self.default_interface.as_ref(),
-        )
-        .await?;
-        self.set_public_info(nat_type, ips, port_range);
-        Ok(self.nat_info())
-    }
-    pub fn nat_info(&self) -> NatInfo {
-        self.nat_info.lock().clone()
-    }
-}
-
-#[derive(Clone)]
-pub struct Puncher {
-    punch_context: Arc<PunchContext>,
-    puncher: CorePuncher,
-    tunnel_router: TunnelRouter,
-    kcp_context: KcpContext,
-}
-impl Puncher {
-    fn new(
-        punch_context: Arc<PunchContext>,
-        puncher: CorePuncher,
-        tunnel_router: TunnelRouter,
-        kcp_context: KcpContext,
-    ) -> Self {
-        Self {
-            punch_context,
-            puncher,
-            tunnel_router,
-            kcp_context,
+    pub async fn next(&mut self) -> Option<Result<bytes::BytesMut, std::io::Error>> {
+        loop {
+            if let Some(kcp_framed) = self.kcp_framed.as_mut() {
+                tokio::select! {
+                    rs=kcp_framed.next()=>{
+                        if let Some(Ok(rs)) = rs{
+                            return Some(Ok(rs));
+                        }
+                        self.kcp_framed.take();
+                    }
+                    rs=self.relay_framed.next()=>{
+                        return rs;
+                    }
+                }
+            }
         }
     }
-    /// Get current NAT information
-    pub fn nat_info(&self) -> NatInfo {
-        self.punch_context.nat_info()
+    pub fn local_addr(&self) -> SocketAddr {
+        self.relay_framed.local_addr()
     }
-    /// Initiate a hole punching attempt to the remote peer
-    pub async fn punch(&self, peer_id: &Arc<String>, punch_info: PunchInfo) -> io::Result<()> {
-        if peer_id == &self.punch_context.oneself_id {
-            return Err(Error::new(
-                io::ErrorKind::Other,
-                "Cannot connect to oneself",
-            ));
-        }
-        if !self.puncher.need_punch(&punch_info) {
-            return Ok(());
-        }
-        if self.tunnel_router.route_table.no_need_punch(peer_id) {
-            return Ok(());
-        }
-        let packet = ping(&self.punch_context.oneself_id)?;
-        self.puncher
-            .punch_now(Some(packet.buffer()), packet.buffer(), punch_info)
-            .await
-    }
-    /// Verify peer reachability (successful hole punching)
-    pub fn is_reachable(&self, peer_id: &Arc<String>) -> bool {
-        self.tunnel_router.route_table.route_one(peer_id).is_some()
-    }
-    /// Connects to the peer after checking reachability using [`Self::is_reachable`].
-    pub fn connect(&self, peer_id: Arc<String>) -> io::Result<KcpStream> {
-        if peer_id == self.punch_context.oneself_id {
-            return Err(Error::new(
-                io::ErrorKind::Other,
-                "Cannot connect to oneself",
-            ));
-        }
-        self.kcp_context
-            .new_stream(self.tunnel_router.clone(), peer_id)
-    }
-}
-
-pub async fn new_tunnel_component(oneself_id: String) -> io::Result<(Puncher, KcpStreamListener)> {
-    if oneself_id.len() > 255 {
-        return Err(Error::new(
-            io::ErrorKind::InvalidInput,
-            "oneself_id too long",
-        ));
-    }
-    let oneself_id = Arc::new(oneself_id);
-    let config = TunnelConfig::new(Box::new(LengthPrefixedInitCodec));
-    let (unified_tunnel_factory, puncher) = rust_p2p_core::tunnel::new_tunnel_component(config)?;
-    let route_table = RouteTable::new(LoadBalance::default());
-    let idle_route_manager = IdleRouteManager::new(Duration::from_secs(5), route_table.clone());
-    let shutdown_manager = ShutdownManager::new();
-    let socket_manager = unified_tunnel_factory.socket_manager();
-    let local_tcp_port = if let Some(v) = socket_manager.tcp_socket_manager_as_ref() {
-        v.local_addr().port()
-    } else {
-        0
-    };
-    let local_udp_ports = if let Some(v) = socket_manager.udp_socket_manager_as_ref() {
-        v.local_ports()?
-    } else {
-        vec![]
-    };
-    let punch_context = PunchContext::new(
-        oneself_id.clone(),
-        None,
-        vec![
-            "stun.flashdance.cx".to_string(),
-            "stun.sipnet.net".to_string(),
-            "stun.nextcloud.com:443".to_string(),
-        ],
-        vec![
-            "stun.miwifi.com".to_string(),
-            "stun.chat.bilibili.com".to_string(),
-            "stun.hitv.com".to_string(),
-            "stun.l.google.com:19302".to_string(),
-            "stun1.l.google.com:19302".to_string(),
-            "stun2.l.google.com:19302".to_string(),
-        ],
-        local_udp_ports,
-        local_tcp_port,
-    );
-    let punch_context = Arc::new(punch_context);
-    start_task(
-        oneself_id,
-        idle_route_manager,
-        shutdown_manager.clone(),
-        route_table.clone(),
-        punch_context.clone(),
-        socket_manager.clone(),
-    );
-    let tunnel_router = TunnelRouter::new(route_table.clone(), socket_manager);
-    let (kcp_context, kcp_listener) = KcpStreamListener::new(tunnel_router.clone());
-
-    tokio::spawn(tunnel::dispatch(
-        shutdown_manager.clone(),
-        unified_tunnel_factory,
-        route_table,
-        punch_context.clone(),
-        kcp_context.clone(),
-    ));
-    punch_context.update_local_addr().await;
-    let puncher = Puncher::new(punch_context, puncher, tunnel_router.clone(), kcp_context);
-
-    Ok((puncher, kcp_listener))
 }

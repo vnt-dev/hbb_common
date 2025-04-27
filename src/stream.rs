@@ -1,4 +1,4 @@
-use crate::{config, tcp, websocket, ResultType};
+use crate::{config, punch, tcp, websocket, ResultType};
 use sodiumoxide::crypto::secretbox::Key;
 use std::net::SocketAddr;
 
@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 pub enum Stream {
     WebSocket(websocket::WsFramedStream),
     Tcp(tcp::FramedStream),
+    Punch(punch::ClientFramedStream),
 }
 
 impl Stream {
@@ -14,6 +15,7 @@ impl Stream {
         match self {
             Stream::WebSocket(s) => s.set_send_timeout(ms),
             Stream::Tcp(s) => s.set_send_timeout(ms),
+            Stream::Punch(s) => s.set_send_timeout(ms),
         }
     }
 
@@ -22,6 +24,7 @@ impl Stream {
         match self {
             Stream::WebSocket(s) => s.set_raw(),
             Stream::Tcp(s) => s.set_raw(),
+            Stream::Punch(s) => s.set_raw(),
         }
     }
 
@@ -30,6 +33,7 @@ impl Stream {
         match self {
             Stream::WebSocket(s) => s.send_bytes(bytes).await,
             Stream::Tcp(s) => s.send_bytes(bytes).await,
+            Stream::Punch(s) => s.send_bytes(bytes).await,
         }
     }
 
@@ -38,6 +42,7 @@ impl Stream {
         match self {
             Stream::WebSocket(s) => s.send_raw(bytes).await,
             Stream::Tcp(s) => s.send_raw(bytes).await,
+            Stream::Punch(s) => s.send_raw(bytes).await,
         }
     }
 
@@ -46,6 +51,7 @@ impl Stream {
         match self {
             Stream::WebSocket(s) => s.set_key(key),
             Stream::Tcp(s) => s.set_key(key),
+            Stream::Punch(s) => s.set_key(key),
         }
     }
 
@@ -54,6 +60,7 @@ impl Stream {
         match self {
             Stream::WebSocket(s) => s.is_secured(),
             Stream::Tcp(s) => s.is_secured(),
+            Stream::Punch(s) => s.is_secured(),
         }
     }
 
@@ -65,6 +72,7 @@ impl Stream {
         match self {
             Stream::WebSocket(s) => s.next_timeout(timeout).await,
             Stream::Tcp(s) => s.next_timeout(timeout).await,
+            Stream::Punch(s) => s.next_timeout(timeout).await,
         }
     }
 
@@ -88,6 +96,7 @@ impl Stream {
         match self {
             Self::WebSocket(ws) => ws.send(msg).await,
             Self::Tcp(tcp) => tcp.send(msg).await,
+            Self::Punch(s) => s.send(msg).await,
         }
     }
 
@@ -97,6 +106,7 @@ impl Stream {
         match self {
             Self::WebSocket(ws) => ws.next().await,
             Self::Tcp(tcp) => tcp.next().await,
+            Self::Punch(s) => s.next().await,
         }
     }
 
@@ -105,6 +115,7 @@ impl Stream {
         match self {
             Self::WebSocket(ws) => ws.local_addr(),
             Self::Tcp(tcp) => tcp.local_addr(),
+            Self::Punch(s) => s.local_addr(),
         }
     }
 }

@@ -370,6 +370,32 @@ impl KcpStream {
         &self.peer_id
     }
 }
+impl AsyncWrite for KcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        Pin::new(&mut self.write).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Pin::new(&mut self.write).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        Pin::new(&mut self.write).poll_shutdown(cx)
+    }
+}
+impl AsyncRead for KcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.read).poll_read(cx, buf)
+    }
+}
 
 pub struct KcpStreamListener {
     input_receiver: Receiver<(Arc<String>, BytesMut)>,
