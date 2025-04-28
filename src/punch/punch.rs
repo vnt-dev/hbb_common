@@ -150,21 +150,30 @@ impl PunchContext {
     }
 }
 
-#[derive(Clone)]
 pub struct Puncher {
+    lock: tokio::sync::Mutex<()>,
+    shutdown_manager: ShutdownManager<()>,
     punch_context: Arc<PunchContext>,
     puncher: CorePuncher,
     tunnel_router: TunnelRouter,
     kcp_context: KcpContext,
 }
+impl Drop for Puncher {
+    fn drop(&mut self) {
+        let _ = self.shutdown_manager.trigger_shutdown(());
+    }
+}
 impl Puncher {
     fn new(
+        shutdown_manager: ShutdownManager<()>,
         punch_context: Arc<PunchContext>,
         puncher: CorePuncher,
         tunnel_router: TunnelRouter,
         kcp_context: KcpContext,
     ) -> Self {
         Self {
+            lock: Default::default(),
+            shutdown_manager,
             punch_context,
             puncher,
             tunnel_router,
@@ -177,6 +186,10 @@ impl Puncher {
     }
     /// Initiate a hole punching attempt to the remote peer
     pub async fn punch(&self, peer_id: &Arc<String>, punch_info: PunchInfo) -> io::Result<()> {
+        let Ok(_lock) = self.lock.try_lock() else {
+            // Do not repeat
+            return Ok(());
+        };
         if peer_id == &self.punch_context.oneself_id {
             return Err(Error::new(
                 io::ErrorKind::Other,
@@ -274,7 +287,13 @@ pub async fn new_tunnel_component(oneself_id: String) -> io::Result<(Puncher, Kc
         kcp_context.clone(),
     ));
     punch_context.update_local_addr().await;
-    let puncher = Puncher::new(punch_context, puncher, tunnel_router.clone(), kcp_context);
+    let puncher = Puncher::new(
+        shutdown_manager,
+        punch_context,
+        puncher,
+        tunnel_router.clone(),
+        kcp_context,
+    );
 
     Ok((puncher, kcp_listener))
 }

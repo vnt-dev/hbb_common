@@ -185,7 +185,7 @@ impl KcpContext {
         }
 
         if self.sender.send((key.0, buf.into())).await.is_err() {
-            log::warn!("input error");
+            log::debug!("input error");
         }
     }
     pub(crate) fn new_stream(

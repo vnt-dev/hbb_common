@@ -12,15 +12,33 @@ use bytes::Bytes;
 pub use kcp_stream::*;
 pub use punch::*;
 use sodiumoxide::crypto::secretbox::Key;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::ToSocketAddrs;
+use tokio::sync::Mutex;
 use tokio_socks::IntoTargetAddr;
 use tokio_util::codec::Framed;
 
+lazy_static::lazy_static! {
+    pub static ref PUNCHER:Arc<Mutex<Option<Arc<Puncher>>>> = Arc::new(Mutex::new(None));
+}
+
+pub async fn gen_client_puncher(oneself_id: String) -> io::Result<Arc<Puncher>> {
+    let mut guard = PUNCHER.lock().await;
+    if let Some(p) = guard.as_ref() {
+        return Ok(p.clone());
+    }
+    let (puncher, _listener) = new_tunnel_component(oneself_id).await?;
+    let puncher = Arc::new(puncher);
+    guard.replace(puncher.clone());
+    drop(guard);
+    Ok(puncher)
+}
+
 pub struct ClientFramedStream {
     peer_id: Arc<String>,
-    puncher: Puncher,
+    puncher: Arc<Puncher>,
     // Channel relayed from the server
     relay_framed: tcp::FramedStream,
     // directly connected KCP channel and reuse the FramedStream structure
@@ -28,7 +46,7 @@ pub struct ClientFramedStream {
 }
 impl ClientFramedStream {
     pub async fn new<T: ToSocketAddrs + std::fmt::Display>(
-        puncher: Puncher,
+        puncher: Arc<Puncher>,
         peer_id: Arc<String>,
         remote_addr: T,
         local_addr: Option<SocketAddr>,
@@ -43,7 +61,7 @@ impl ClientFramedStream {
         })
     }
     pub async fn connect<'t, T>(
-        puncher: Puncher,
+        puncher: Arc<Puncher>,
         peer_id: Arc<String>,
         target: T,
         local_addr: Option<SocketAddr>,
